@@ -21,7 +21,7 @@ app = Flask(__name__)
 ANALYZOR_URL = os.environ.get('ANALYZOR_URL', 'http://localhost:8000')
 LEDGER_API_URL = os.environ.get('LEDGER_API_URL', 'http://localhost:8080')
 SUBSCRIPTIONS_API_URL = os.environ.get('SUBSCRIPTIONS_API_URL', 'http://localhost:8082')
-SUBSCRIPTIONS_SERVICE_KEY = os.environ.get('SUBSCRIPTIONS_SERVICE_KEY', '***REMOVED_SERVICE_KEY***')
+SUBSCRIPTIONS_SERVICE_KEY = os.environ.get('SUBSCRIPTIONS_SERVICE_KEY', '')
 # Lien "Ouvrir Suivre Mes Comptes" dans l'email quotidien (2026-07-26) — même Navigator pour
 # toute org, jamais une URL par org codée en dur (?orgId= ajouté dynamiquement à l'envoi).
 NAVIGATOR_URL = os.environ.get('NAVIGATOR_URL', 'https://script.google.com/macros/s/AKfycbzJ_mGTi4mYSVAMBZIWJ1ybbEaDyOaF6AGrzZo-VU8mv7jp5n5YzE2vCJcCz4JBX3TEkQ/exec')
@@ -130,6 +130,35 @@ CONNECTOR_REGISTRY = {
 }
 
 
+SYNC_STATUS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sync_status")
+
+
+def _account_key(contenu):
+    """Clé stable d un compte (identique partout : etablissement|nature|titulaire|produit)."""
+    return "|".join((contenu.get(k) or "") for k in ("etablissement", "nature", "titulaire", "produit"))
+
+
+def _write_sync_status(org_id, status):
+    """Persiste le dernier resultat de synchro par compte (etat derive, regenere a chaque sync).
+    But : SMC peut dire au user, dans le mail ET l interface, ce qui deconne (2026-08-20)."""
+    try:
+        os.makedirs(SYNC_STATUS_DIR, exist_ok=True)
+        p = os.path.join(SYNC_STATUS_DIR, f"{org_id}.json")
+        with open(p + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(status, f, ensure_ascii=False)
+        os.replace(p + ".tmp", p)
+    except OSError:
+        pass
+
+
+def _read_sync_status(org_id):
+    try:
+        with open(os.path.join(SYNC_STATUS_DIR, f"{org_id}.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
 def _sync_one_compte(org_id, module, compte_brick):
     contenu = compte_brick.get('contenu', {})
     nom = contenu.get('nom') or compte_brick.get('title') or compte_brick.get('id')
@@ -203,7 +232,13 @@ def _sync_org_comptes(org_id, module):
     Factorisé (2026-07-26) : appelé par la route /api/executor/sync ET par daily_report avant
     de calculer le patrimoine, pour que l'email quotidien reflète des soldes fraîchement
     synchronisés plutôt que la dernière valeur connue (retour de Stéphane : "il faut bien sûr
-    automatiser avant l'envoi d'email")."""
+    automatiser avant l'envoi d'email").
+
+    Résout le module lui-même s'il n'est pas fourni (2026-08-20) : sans module, la résolution
+    connector (règles au niveau module:suivre_mes_comptes) ne matche rien et TOUS les comptes
+    retombent en échec — un appelant qui oublie `module` (ex. bouton "actualiser" de l'UI)
+    cassait silencieusement toute la synchro."""
+    module = _resolve_module(org_id, module)
     r = requests.get(f'{ANALYZOR_URL}/api/org/{org_id}/bricks', params={'type': 'Compte'}, timeout=30)
     r.raise_for_status()
     comptes = r.json().get('bricks', [])
@@ -216,6 +251,15 @@ def _sync_org_comptes(org_id, module):
         f'Synchronisation : {n_ok}/{len(results)} comptes OK',
         [f"{r['compte']} : {'OK' if r['success'] else r.get('error')}" for r in results],
     )
+    # Persiste le statut par compte pour que SMC puisse le remonter (email + interface).
+    status = {}
+    _now = datetime.now().isoformat(timespec="seconds")
+    for c, r in zip(comptes, results):
+        cc = c.get("contenu", {})
+        err = None if r["success"] else r.get("error")
+        mode = "manual" if (err and "Aucun connector" in err) else "api"
+        status[_account_key(cc)] = {"ok": r["success"], "error": err, "mode": mode, "ts": _now}
+    _write_sync_status(org_id, status)
     return results
 
 
@@ -285,7 +329,17 @@ def sync_one():
         if compte_brick is None:
             return jsonify({'success': False, 'error': 'Compte introuvable pour ces critères'}), 404
 
+        module = _resolve_module(org_id, module)
         result = _sync_one_compte(org_id, module, compte_brick)
+        try:  # refléter l'actualisation manuelle dans le statut lu par l'UI/email
+            _st = _read_sync_status(org_id)
+            _cc = compte_brick.get('contenu', {})
+            _err = None if result.get('success') else result.get('error')
+            _mode = 'manual' if (_err and 'Aucun connector' in _err) else 'api'
+            _st[_account_key(_cc)] = {'ok': result.get('success'), 'error': _err, 'mode': _mode, 'ts': datetime.now().isoformat(timespec='seconds')}
+            _write_sync_status(org_id, _st)
+        except Exception:
+            pass
         return jsonify(result)
 
     except Exception as e:
@@ -1044,6 +1098,7 @@ def _patrimoine_view_data(org_id, module):
     briques, 2026-07-26) est maintenant mis en cache côté Analyzor (bricks.py::list_bricks,
     6h de TTL) mais le tout premier appel après un redémarrage reste proche de l'ancienne
     limite de 10s — cause réelle d'un 502 intermittent observé en usage réel avant ce correctif."""
+    module = _resolve_module(org_id, module)  # sinon resolve-batch (règles module) -> tout "manual"
     r = requests.get(f'{ANALYZOR_URL}/api/org/{org_id}/bricks', params={'type': 'Compte'}, timeout=30)
     r.raise_for_status()
     comptes_bricks = r.json().get('bricks', [])
@@ -1081,6 +1136,17 @@ def _patrimoine_view_data(org_id, module):
     except requests.RequestException:
         pass  # résolution indisponible : tout reste 'manual', jamais bloquant pour l'affichage
 
+    _status = _read_sync_status(org_id)
+    _today = datetime.now()
+
+    def _stale_days(last_date):
+        if not last_date:
+            return None
+        try:
+            return (_today - datetime.strptime(last_date, "%Y/%m/%d")).days
+        except (ValueError, TypeError):
+            return None
+
     comptes = []
     for b, sync_mode in zip(comptes_bricks, sync_modes):
         c = b.get('contenu', {})
@@ -1102,7 +1168,9 @@ def _patrimoine_view_data(org_id, module):
             'devise': c.get('devise_origine') or 'EUR',
             'solde': solde_info.get('solde', 0.0),
             'lastDate': solde_info.get('lastDate'),
+            'staleDays': _stale_days(solde_info.get('lastDate')),
             'syncMode': sync_mode,
+            'syncStatus': _status.get(_account_key(c)),
         })
 
     return comptes
