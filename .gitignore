@@ -8,3 +8,6 @@ __pycache__/
 *.bak-*
 CLAUDE.md
 data/report_schedules.json
+
+# Etat de synchro runtime par org — jamais versionne
+sync_status/

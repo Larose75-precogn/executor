@@ -29,7 +29,7 @@ NAVIGATOR_URL = os.environ.get('NAVIGATOR_URL', 'https://script.google.com/macro
 # redirect_url pour le flux d'autorisation Enable Banking (2026-07-27) : le navigateur du PSU
 # doit pouvoir l'atteindre directement, contrairement à ANALYZOR_URL/LEDGER_API_URL qui restent
 # des appels serveur-à-serveur en localhost.
-EXECUTOR_PUBLIC_URL = os.environ.get('EXECUTOR_PUBLIC_URL', 'http://213.32.16.118:8084')
+EXECUTOR_PUBLIC_URL = os.environ.get('EXECUTOR_PUBLIC_URL', 'https://exec.precogn.org')
 
 
 def log_to_journal(org_id, actor, summary, details=None):
@@ -105,7 +105,7 @@ def _qonto_secret_name(compte_brick):
 
 CONNECTOR_REGISTRY = {
     'connector_mercury': {'fetch': connector_mercury.fetch, 'secret_name': 'mercury_api_key'},
-    'connector_qonto': {'fetch': connector_qonto.fetch, 'secret_name_fn': _qonto_secret_name},
+    'connector_qonto': {'fetch': connector_qonto.fetch, 'fetch_transactions': connector_qonto.fetch_transactions, 'secret_name_fn': _qonto_secret_name},
     # Un seul secret partagé pour toute l'org : contrairement à Qonto, l'app_id + la clé privée
     # Enable Banking ne sont pas liés à un établissement précis (l'établissement/la banque est
     # déterminé par le consentement PSD2 déjà donné, capturé sur `enablebanking_account_uid` de
@@ -260,6 +260,7 @@ def _sync_org_comptes(org_id, module):
         mode = "manual" if (err and "Aucun connector" in err) else "api"
         status[_account_key(cc)] = {"ok": r["success"], "error": err, "mode": mode, "ts": _now}
     _write_sync_status(org_id, status)
+    _update_journal_errors(org_id, comptes, results)
     return results
 
 
@@ -338,6 +339,7 @@ def sync_one():
             _mode = 'manual' if (_err and 'Aucun connector' in _err) else 'api'
             _st[_account_key(_cc)] = {'ok': result.get('success'), 'error': _err, 'mode': _mode, 'ts': datetime.now().isoformat(timespec='seconds')}
             _write_sync_status(org_id, _st)
+            _update_journal_errors(org_id, [compte_brick], [result])
         except Exception:
             pass
         return jsonify(result)
@@ -1171,6 +1173,7 @@ def _patrimoine_view_data(org_id, module):
             'staleDays': _stale_days(solde_info.get('lastDate')),
             'syncMode': sync_mode,
             'syncStatus': _status.get(_account_key(c)),
+            'linked': bool(c.get('powens_account_id') or c.get('enablebanking_account_uid')),
         })
 
     return comptes
@@ -1456,6 +1459,12 @@ def _build_report_email(payload):
         ligne = f"  · {c['nom']} : {_fmt_amount(c['solde'], c['devise'])}"
         if c.get('variation'):
             ligne += f" ({_fmt_variation(c['variation'], c['devise'])} depuis hier)"
+        _st = c.get('syncStatus') or {}
+        if c.get('syncMode') == 'api' and _st.get('ok') is False:
+            ligne += " (à reconnecter quand tu pourras)"
+        elif c.get('syncMode') == 'manual':
+            _d = c.get('staleDays')
+            ligne += f" (manuel, actualisé il y a {_d} j)" if _d is not None else " (manuel, à renseigner)"
         text_lines.append(ligne)
     text_lines += ['', f"Ouvrir Suivre Mes Comptes : {payload['navigatorUrl']}"]
     text_body = '\n'.join(text_lines)
@@ -1468,14 +1477,27 @@ def _build_report_email(payload):
         {_fmt_variation(payload['variationEur'], 'EUR')} depuis hier
       </div>'''
 
+    def _sync_note_html(c):
+        mode = c.get('syncMode'); st = c.get('syncStatus') or {}; days = c.get('staleDays')
+        if mode == 'api' and st.get('ok') is False:
+            return '<div style="font-size:11px;color:#b45309;">à reconnecter quand tu pourras</div>'
+        if mode == 'manual':
+            if days is None:
+                return '<div style="font-size:11px;color:#9ca3af;">à renseigner quand tu veux</div>'
+            if days >= 1:
+                col = '#b45309' if days >= 21 else '#9ca3af'
+                return f'<div style="font-size:11px;color:{col};">actualisé il y a {days} j (manuel)</div>'
+        return ''
+
     def _compte_row_html(c):
         variation_html = ''
         if c.get('variation'):
             couleur = '#1a8a4a' if c['variation'] > 0 else '#c0392b'
             variation_html = f'<div style="font-size:11px;color:{couleur};">{_fmt_variation(c["variation"], c["devise"])} depuis hier</div>'
+        note = _sync_note_html(c)
         return f'''
       <tr>
-        <td style="padding:7px 0;font-size:13px;color:#374151;border-top:1px solid #f3f4f6;">{c['nom']}</td>
+        <td style="padding:7px 0;font-size:13px;color:#374151;border-top:1px solid #f3f4f6;">{c['nom']}{note}</td>
         <td style="padding:7px 0;font-size:13px;color:#374151;text-align:right;border-top:1px solid #f3f4f6;">
           {_fmt_amount(c['solde'], c['devise'])}
           {variation_html}
@@ -1642,6 +1664,7 @@ def _build_patrimoine_payload(org_id, module=None, prefix='Actif:Banque'):
         comptes_out.append({
             'nom': c['nom'], 'solde': c['solde'], 'devise': c['devise'], 'variation': variation,
             'numero': c.get('numero'),
+            'syncMode': c.get('syncMode'), 'staleDays': c.get('staleDays'), 'syncStatus': c.get('syncStatus'),
         })
     comptes_out.sort(key=lambda c: (c['numero'] is None, c['numero'] if c['numero'] is not None else 0))
 
@@ -1665,11 +1688,24 @@ def _build_patrimoine_payload(org_id, module=None, prefix='Actif:Banque'):
     total_hier_eur = sum(totals_hier.get(d, 0) * fx_rates[d] for d in fx_rates)
     variation_eur = round(total_eur - total_hier_eur, 2)
 
+    def _sync_reason(err):
+        e = err or ''
+        if 'introuvable' in e: return "à reconnecter quand tu auras un moment (le lien s'est perdu)"
+        if 'powens_account_id' in e or 'mapping' in e: return 'pas encore connecté'
+        if 'pas encore configuree' in e or 'Cle API' in e or 'configurée' in e or 'Clé' in e: return 'une clé de connexion reste à renseigner'
+        if 'injoignable' in e: return "le connecteur n'a pas répondu aujourd'hui (souvent temporaire)"
+        return 'à revoir quand tu pourras'
+    sync_problems = [
+        {'nom': c['nom'], 'reason': _sync_reason((c.get('syncStatus') or {}).get('error'))}
+        for c in comptes_out
+        if c.get('syncMode') == 'api' and (c.get('syncStatus') or {}).get('ok') is False
+    ]
     payload = {
         'date': today, 'comptes': comptes_out,
         'totalEur': round(total_eur, 2), 'variationEur': variation_eur,
         'navigatorUrl': f'{NAVIGATOR_URL}?orgId={org_id}',
         'ownerName': owner.get('name') if owner else None,
+        'syncProblems': sync_problems,
     }
     return payload, (owner.get('email') if owner else None)
 
@@ -1708,22 +1744,103 @@ REPORT_SCHEDULES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 DEFAULT_REPORT_SCHEDULE = {'frequency': 'daily', 'hour': 0, 'minute': 0}
 
 
-def _load_report_schedules():
-    if not os.path.exists(REPORT_SCHEDULES_FILE):
-        return {}
-    with open(REPORT_SCHEDULES_FILE) as f:
-        return json.load(f)
+SMC_MODULE = 'suivre_mes_comptes'
+_FREQ_FR = {'quotidien': 'daily', 'hebdomadaire': 'weekly', 'mensuel': 'monthly'}
+_FREQ_FR_INV = {v: k for k, v in _FREQ_FR.items()}
+_JOURS_FR = ['lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi', 'dimanche']
 
 
-def _save_report_schedules(schedules):
-    os.makedirs(os.path.dirname(REPORT_SCHEDULES_FILE), exist_ok=True)
-    with open(REPORT_SCHEDULES_FILE, 'w') as f:
-        json.dump(schedules, f, indent=2)
+# --- Journal = source de verite (R-SMC-0003) : les reglages/evenements SMC vivent dans le
+# journal ledger-cli de l'org (sur son OwnStorage/Drive), en lignes commentees '#' que ledger
+# ignore pour la compta. Plus aucun reglage utilisateur dans un fichier du serveur (qu'un
+# incident VPS effacerait -- cause reelle de la perte du planning smcspl fin aout 2026). ---
+def _journal_get(org_id):
+    r = requests.get(f'{ANALYZOR_URL}/api/ownstorage/journal', params={'orgId': org_id}, timeout=20)
+    r.raise_for_status()
+    return r.json().get('content', '') or ''
+
+
+def _journal_set(org_id, content):
+    r = requests.post(f'{ANALYZOR_URL}/api/ownstorage/journal', json={'orgId': org_id, 'content': content}, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def _upsert_directive(text, tag, new_line):
+    """Retire toute ligne commencant par `tag` puis (si new_line) l'ajoute en tete (apres un
+    eventuel commentaire d'en-tete ';'). Ne touche JAMAIS une ecriture comptable."""
+    kept = [l for l in text.splitlines() if not l.strip().startswith(tag)]
+    if new_line:
+        insert_at = 0
+        while insert_at < len(kept) and (kept[insert_at].strip().startswith(';') or not kept[insert_at].strip()):
+            insert_at += 1
+        kept.insert(insert_at, new_line)
+    out = '\n'.join(kept)
+    return out + '\n' if (text.endswith('\n') or not text) else out
+
+
+def _parse_envoimailauto(text):
+    """Directive #envoimailauto du journal -> schedule dict, ou None si absente (= pas d'envoi)."""
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith('#envoimailauto'):
+            continue
+        kv = {}
+        for tok in s.split()[1:]:
+            if '=' in tok:
+                k, v = tok.split('=', 1)
+                kv[k.lower()] = v
+        freq = _FREQ_FR.get(kv.get('frequence', '').lower())
+        if not freq:
+            continue
+        try:
+            hour = int(kv.get('heure', 0)); minute = int(kv.get('minute', 0))
+        except ValueError:
+            continue
+        if minute not in (0, 30):
+            minute = 0
+        sched = {'frequency': freq, 'hour': hour, 'minute': minute}
+        if freq == 'weekly':
+            j = kv.get('jour', '').lower()
+            sched['weekday'] = _JOURS_FR.index(j) if j in _JOURS_FR else 0
+        elif freq == 'monthly':
+            try:
+                sched['dayOfMonth'] = int(kv.get('jourdumois', 1))
+            except ValueError:
+                sched['dayOfMonth'] = 1
+        return sched
+    return None
+
+
+def _schedule_to_directive(schedule):
+    parts = ['#envoimailauto',
+             'frequence=' + _FREQ_FR_INV.get(schedule['frequency'], 'quotidien'),
+             'heure=' + str(schedule.get('hour', 0)),
+             'minute=' + str(schedule.get('minute', 0))]
+    if schedule['frequency'] == 'weekly':
+        parts.append('jour=' + _JOURS_FR[schedule.get('weekday', 0)])
+    elif schedule['frequency'] == 'monthly':
+        parts.append('jourdumois=' + str(schedule.get('dayOfMonth', 1)))
+    return ' '.join(parts)
+
+
+def _smc_org_ids():
+    """Orgs de la famille SMC (module=suivre_mes_comptes). La LISTE des orgs est de l'infra
+    (quels orgs existent), pas un reglage utilisateur ; le reglage vit dans chaque journal."""
+    import glob as _glob
+    ids = []
+    for mj in _glob.glob('/home/ubuntu/ledger_api/orgs/*/module.json'):
+        try:
+            if json.load(open(mj)).get('module') == SMC_MODULE:
+                ids.append(os.path.basename(os.path.dirname(mj)))
+        except Exception:
+            pass
+    return ids
 
 
 def _schedule_matches_now(schedule, now):
-    """`now` : datetime avec tzinfo Europe/Paris. Créneaux de 30 min (0 ou 30) — cohérent avec
-    la fréquence du cron, jamais plus précis que ce que le cron peut réellement vérifier."""
+    """`now` : datetime avec tzinfo Europe/Paris. Creneaux de 30 min (0 ou 30) -- coherent avec
+    la frequence du cron, jamais plus precis que ce que le cron peut reellement verifier."""
     slot = 30 if now.minute >= 30 else 0
     if now.hour != schedule.get('hour', 0) or slot != schedule.get('minute', 0):
         return False
@@ -1737,22 +1854,100 @@ def _schedule_matches_now(schedule, now):
     return False
 
 
+# --- #erreursynchro (R-SMC-0003) : marqueur de panne d'un compte dans le journal. Ecrit a
+# l'echec d'un connector, efface au retour a la normale. Groupe en UNE ecriture par synchro. ---
+def _sync_key_dir(cc):
+    parts = [(cc.get('etablissement') or '?'), (cc.get('nature') or '?')]
+    t = cc.get('titulaire')
+    if t:
+        parts.append(t)
+    return ':'.join(parts).replace(' ', '_')
+
+
+def _reason_slug(err):
+    e = (err or '').lower()
+    if '401' in e or 'unauthorized' in e:
+        return 'identifiants-401'
+    if 'introuvable' in e:
+        return 'lien-perdu'
+    if 'powens_account_id' in e or 'mapping' in e:
+        return 'pas-connecte'
+    if 'configur' in e or 'cle' in e or 'clé' in e:
+        return 'cle-manquante'
+    if 'injoignable' in e:
+        return 'service-injoignable'
+    if 'implement' in e or 'implément' in e:
+        return 'connector-absent'
+    return 'a-revoir'
+
+
+def _line_is_err_for(line, key):
+    s = line.strip()
+    return s.startswith('#erreursynchro') and ('compte=' + key) in s.split()
+
+
+def _update_journal_errors(org_id, comptes, results):
+    """Ecrit/efface les directives #erreursynchro dans le journal en UNE ecriture. Compte api en
+    echec -> ligne (en preservant 'depuis' si deja presente) ; succes ou compte manuel (sans
+    connector) -> ligne effacee. Jamais bloquant."""
+    import re as _re
+    try:
+        text = _journal_get(org_id)
+    except requests.RequestException:
+        return
+    today = datetime.now().strftime('%Y/%m/%d')
+    lines = text.splitlines()
+    changed = False
+    for c, r in zip(comptes, results):
+        cc = c.get('contenu', {})
+        key = _sync_key_dir(cc)
+        err = None if r.get('success') else r.get('error')
+        is_api_fail = (err is not None) and ('Aucun connector' not in err)
+        existing = next((l for l in lines if _line_is_err_for(l, key)), None)
+        lines = [l for l in lines if not _line_is_err_for(l, key)]
+        if is_api_fail:
+            depuis = today
+            if existing:
+                m = _re.search(r'depuis=(\S+)', existing)
+                if m:
+                    depuis = m.group(1)
+            new_line = '#erreursynchro compte=' + key + ' depuis=' + depuis + ' raison=' + _reason_slug(err)
+            insert_at = 0
+            while insert_at < len(lines) and (lines[insert_at].strip().startswith(';') or lines[insert_at].strip().startswith('#') or not lines[insert_at].strip()):
+                insert_at += 1
+            lines.insert(insert_at, new_line)
+            changed = True
+        elif existing:
+            changed = True
+    if changed:
+        out = '\n'.join(lines) + ('\n' if (text.endswith('\n') or not text) else '')
+        try:
+            _journal_set(org_id, out)
+        except requests.RequestException:
+            pass
+
+
 @app.route('/api/executor/report-schedule', methods=['GET'])
 def get_report_schedule():
-    """Planning d'envoi configuré pour une org (ou le défaut si jamais configuré explicitement)
-    — pour pré-remplir le formulaire self-service. Query: ?orgId=..."""
+    """Planning d'envoi lu depuis la directive #envoimailauto du journal de l'org (source de
+    verite, R-SMC-0003). `configured`=False si aucune directive (le form affiche alors le defaut,
+    mais aucun envoi automatique n'a lieu tant que rien n'est enregistre). Query: ?orgId=..."""
     org_id = request.args.get('orgId', '')
     if not org_id:
         return jsonify({'success': False, 'error': 'orgId manquant'}), 400
-    schedule = _load_report_schedules().get(org_id, DEFAULT_REPORT_SCHEDULE)
-    return jsonify({'success': True, 'schedule': schedule})
+    try:
+        sched = _parse_envoimailauto(_journal_get(org_id))
+    except requests.RequestException as e:
+        return jsonify({'success': False, 'error': f'journal injoignable : {e}'}), 502
+    return jsonify({'success': True, 'schedule': sched or DEFAULT_REPORT_SCHEDULE, 'configured': sched is not None})
 
 
 @app.route('/api/executor/report-schedule', methods=['POST'])
 def set_report_schedule():
-    """Enregistre le planning d'envoi d'une org. Body: {orgId, frequency: 'daily'|'weekly'|
-    'monthly', hour: 0-23, minute: 0|30, weekday?: 0-6 (lundi=0, requis si weekly),
-    dayOfMonth?: 1-28 (requis si monthly, plafonné à 28 pour éviter les mois courts)."""
+    """Enregistre le planning en ecrivant la directive #envoimailauto DANS le journal de l'org
+    (R-SMC-0003) -- durable sur le Drive, jamais effacable par un incident serveur. Body: {orgId,
+    frequency: 'daily'|'weekly'|'monthly', hour: 0-23, minute: 0|30, weekday?: 0-6 (lundi=0),
+    dayOfMonth?: 1-28}."""
     data = request.get_json() or {}
     org_id = data.get('orgId', '')
     if not org_id:
@@ -1787,26 +1982,30 @@ def set_report_schedule():
             return jsonify({'success': False, 'error': 'Jour du mois requis (1-28)'}), 400
         schedule['dayOfMonth'] = day_of_month
 
-    schedules = _load_report_schedules()
-    schedules[org_id] = schedule
-    _save_report_schedules(schedules)
+    try:
+        text = _journal_get(org_id)
+        _journal_set(org_id, _upsert_directive(text, '#envoimailauto', _schedule_to_directive(schedule)))
+    except requests.RequestException as e:
+        return jsonify({'success': False, 'error': f'ecriture journal impossible : {e}'}), 502
     return jsonify({'success': True, 'schedule': schedule})
 
 
 @app.route('/api/executor/daily-report/check-due', methods=['POST'])
 def check_due_reports():
-    """Appelé par le cron toutes les 30 min (Europe/Paris, voir smc-daily-report.timer) —
-    envoie le rapport à chaque org dont l'horaire configuré (report-schedule) correspond à
-    maintenant. Une org jamais configurée explicitement n'est PAS dans ce fichier et n'est donc
-    jamais envoyée automatiquement ici (elle doit d'abord choisir un planning, self-service) —
-    évite d'envoyer par défaut à une org qui n'a jamais rien demandé. Jamais bloquant : l'échec
-    d'une org n'empêche pas les autres."""
+    """Cron toutes les 30 min (Europe/Paris) -- pour chaque org SMC, lit la directive
+    #envoimailauto de SON journal (R-SMC-0003) et envoie si l'horaire correspond a maintenant.
+    Aucune directive = aucun envoi (l'org n'a rien demande). Jamais bloquant : l'echec d'une org
+    n'empeche pas les autres."""
     from zoneinfo import ZoneInfo
     now_paris = datetime.now(ZoneInfo('Europe/Paris'))
-    schedules = _load_report_schedules()
     results = {}
-    for org_id, schedule in schedules.items():
-        if not _schedule_matches_now(schedule, now_paris):
+    for org_id in _smc_org_ids():
+        try:
+            sched = _parse_envoimailauto(_journal_get(org_id))
+        except Exception as e:
+            results[org_id] = {'success': False, 'error': f'journal illisible : {e}'}
+            continue
+        if not sched or not _schedule_matches_now(sched, now_paris):
             continue
         try:
             results[org_id] = _send_daily_report(org_id)
