@@ -1,17 +1,16 @@
 """Connector Powens — fetch(compte_brick, credentials) -> [{solde, devise}]
 (§8 ARCHITECTURE.md Suivre Mes Comptes). Agrégateur DSP2 français (ex-Budget Insight,
-powens.com), utilisé pour Banque BCP — ni Enable Banking (établissement absent de leur liste
-~2600 ASPSPs, vérifié 2026-07-26) ni un accès direct (même mur réglementaire AISP/eIDAS que
-Crédit Mutuel) ne le couvraient.
+powens.com), utilisé pour une banque non couverte autrement — ni Enable Banking (établissement
+absent de leur liste ~2600 ASPSPs, vérifié 2026-07-26) ni un accès direct (même mur réglementaire
+AISP/eIDAS) ne le couvraient.
 
-Authentification : `POST /auth/init` avec client_id+client_secret (app Powens "smc", domaine
-`smc-sandbox.biapi.pro` — nom "sandbox" trompeur, connecte de VRAIES banques avec de VRAIES
-données, vérifié avec le vrai compte Banque BCP de Stéphane, 2569,99€ récupérés en conditions
-réelles). **Piège réel trouvé en testant** : `/auth/init` n'est PAS idempotent — chaque appel
+Authentification : `POST /auth/init` avec client_id+client_secret (app Powens de l'org, dont le
+domaine peut contenir "sandbox" — nom trompeur : il connecte de VRAIES banques avec de VRAIES
+données, vérifié en conditions réelles sur un vrai compte). **Piège réel trouvé en testant** : `/auth/init` n'est PAS idempotent — chaque appel
 crée un NOUVEL utilisateur Powens (`id_user` incrémente à chaque fois, 1 puis 3 puis 4...),
 comme une inscription, pas un rafraîchissement de token. Le connecteur qui appelait `/auth/init`
 à chaque synchro se retrouvait donc systématiquement avec un utilisateur tout neuf, sans la
-connexion BCP déjà établie (`GET /users/me/accounts` vide). Le `auth_token` permanent obtenu la
+connexion bancaire déjà établie (`GET /users/me/accounts` vide). Le `auth_token` permanent obtenu la
 toute première fois (lié à l'utilisateur qui a réellement la connexion bancaire) doit être
 stocké tel quel et réutilisé indéfiniment — jamais régénéré par un connector en usage normal.
 
@@ -31,7 +30,7 @@ import requests
 
 def fetch(compte_brick, credentials_json):
     """`credentials_json` : secret org `powens_credentials`, JSON sérialisé
-    {"domain": "smc-sandbox", "auth_token": "..."} — le token PERMANENT capturé lors de la 1re
+    {"domain": "votre-domaine", "auth_token": "..."} — le token PERMANENT capturé lors de la 1re
     connexion (voir docstring du module), jamais client_id/client_secret régénérant un nouvel
     utilisateur à chaque appel."""
     credentials = json.loads(credentials_json)
@@ -56,8 +55,7 @@ def fetch(compte_brick, credentials_json):
 def fetch_transactions(compte_brick, credentials_json, limit=200, max_pages=10):
     """JournaldeBanque (2026-08-14) — historique DÉTAILLÉ des transactions d'un compte déjà
     lié, jamais consommé jusqu'ici (`fetch()` ci-dessus ne remonte que le solde courant).
-    Vérifié en HTTP direct, lecture seule, avec de VRAIES données smcspl (2026-08-13, voir
-    ~/projects/jdb/CLAUDE.md) : `GET /users/me/accounts/{id}/transactions` répond avec
+    Vérifié en HTTP direct, lecture seule, avec de vraies données d'une org (2026-08-13) : `GET /users/me/accounts/{id}/transactions` répond avec
     `first_date`/`last_date`, pagination par `cursor` dans `_links.next`, et pour chaque
     transaction `id`, `date`, `value` (déjà signé, débit négatif/crédit positif), `wording`/
     `simplified_wording`/`original_wording`, `state`.

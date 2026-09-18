@@ -29,7 +29,7 @@ def fetch(compte_brick, api_key):
 
     # Le token Mercury est parfois copié avec son préfixe "secret-token:" déjà inclus, parfois
     # sans — gérer les deux plutôt que de le doubler par erreur (bug évité en préparant
-    # l'enregistrement de la vraie clé de Stéphane, 2026-07-25).
+    # l'enregistrement de la vraie clé d'une org, 2026-07-25).
     token = api_key if api_key.startswith('secret-token:') else f'secret-token:{api_key}'
     r = requests.get(
         f'{MERCURY_API_BASE}/accounts',

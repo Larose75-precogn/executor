@@ -78,10 +78,9 @@ def _org_secret_value(org_id, name):
 # bloque jamais les autres comptes.
 #
 # `secret_name_fn` (au lieu de `secret_name` fixe) : nécessaire pour Qonto, où une clé API
-# authentifie UNE SEULE organisation Qonto (pas un accès multi-comptes comme Mercury) — "Ferme
-# Verte 323" et "Ferme Verte Photovoltaïque" sont deux organisations Qonto distinctes avec deux
-# credentials séparés (confirmé 2026-07-25 par Stéphane, captures d'écran du panneau API Qonto
-# des deux comptes). Le nom du secret est donc dérivé du `titulaire` de la brique Compte plutôt
+# authentifie UNE SEULE organisation Qonto (pas un accès multi-comptes comme Mercury) — deux
+# titulaires différents d'une même org peuvent correspondre à deux organisations Qonto distinctes
+# avec deux credentials séparés (cas vérifié le 2026-07-25). Le nom du secret est donc dérivé du `titulaire` de la brique Compte plutôt
 # que fixe.
 import re
 
@@ -476,8 +475,8 @@ def fetch_transactions_route():
 # ============================================================
 # ENABLE BANKING — liaison d'un nouveau compte (2026-07-27, retour de Stéphane : "le fondement
 # de ce programme" — jusqu'ici seul fetch() [solde d'un compte DÉJÀ lié] existait, tout le flux
-# d'autorisation initiale avait été fait une fois à la main hors service pour le vrai Crédit
-# Mutuel). État `_eb_pending` en mémoire (process unique, un redémarrage perd les liaisons en
+# d'autorisation initiale avait été fait une fois à la main hors service pour un vrai
+# établissement). État `_eb_pending` en mémoire (process unique, un redémarrage perd les liaisons en
 # cours — acceptable, un flux d'autorisation dure quelques minutes, jamais des heures) :
 # state -> {orgId, email, expiresAt, accounts?}. `accounts` rempli seulement après le callback.
 # ============================================================
@@ -495,26 +494,26 @@ def _eb_credentials(org_id):
     factices).
 
     Nom de secret DÉLIBÉRÉMENT distinct de `enablebanking_credentials` (bug réel trouvé et
-    corrigé le 2026-07-28 : réutiliser ce même nom cassait smcspl, qui a DÉJÀ un
+    corrigé le 2026-07-28 : réutiliser ce même nom cassait une org existante, qui a DÉJÀ un
     `enablebanking_credentials` — l'app de production PARTAGÉE utilisée par
-    CONNECTOR_REGISTRY/fetch() pour synchroniser Crédit Mutuel, `Restricted` côté Enable Banking,
+    CONNECTOR_REGISTRY/fetch() pour synchroniser un compte déjà lié, `Restricted` côté Enable Banking,
     qui ne peut PAS lier de nouveaux comptes). Les deux secrets peuvent coexister pour une même
     org : `enablebanking_credentials` sert UNIQUEMENT à synchroniser des comptes déjà liés,
     `enablebanking_selfservice_credentials` sert UNIQUEMENT à en lier de nouveaux — deux apps
     Enable Banking différentes, deux usages différents, même si toutes deux "de production".
 
     Repli sur `enablebanking_credentials` en dernier recours (mode='restricted', 2026-07-29,
-    retour de Stéphane : la recherche de banque ne trouvait pas "Crédit Mutuel" alors que
+    retour de Stéphane : la recherche de banque ne trouvait pas la banque de l'org alors que
     l'organisation a DÉJÀ un vrai accès Enable Banking pour ce compte — vérifié : `/aspsps` avec
-    CES identifiants renvoie bien un catalogue complet, 2632 banques, Crédit Mutuel inclus, la
+    CES identifiants renvoie bien un catalogue complet, 2632 banques, la banque de l'org incluse, la
     restriction ne bloque QUE la liaison de nouveaux comptes, pas la lecture du catalogue). Une
     tentative de liaison avec ce mode peut échouer côté Enable Banking (app Restricted) — c'est
     alors Enable Banking lui-même qui le dira, jamais caché ou deviné à l'avance côté recherche."""
     # Ordre de priorité : production self-service (peut tout faire) > restricted (vrai
     # catalogue + tentative de liaison réelle, même si elle peut échouer) > sandbox (dernier
     # recours, jamais de vraie banque). Bug réel trouvé le 2026-07-29 : 'sandbox' était vérifié
-    # AVANT 'restricted' — smcspl a les deux secrets configurés, donc 'sandbox' gagnait toujours
-    # et la recherche ne voyait jamais le vrai catalogue Crédit Mutuel de l'app restricted.
+    # AVANT 'restricted' — une org ayant les deux secrets configurés, donc 'sandbox' gagnait toujours
+    # et la recherche ne voyait jamais le vrai catalogue de l'app restricted.
     raw = _org_secret_value(org_id, 'enablebanking_selfservice_credentials')
     if raw:
         return json.loads(raw), 'production'
@@ -553,7 +552,7 @@ def enablebanking_start_auth():
             return jsonify({'success': False, 'error': 'Aucun identifiant Enable Banking configuré pour cette organisation'}), 404
 
         if mode in ('production', 'restricted'):
-            # 'restricted' (2026-07-29) : l'app existante (Crédit Mutuel) peut refuser de lier
+            # 'restricted' (2026-07-29) : l'app existante (restreinte à un établissement déjà lié) peut refuser de lier
             # un NOUVEAU compte — mais on tente quand même avec le vrai nom de banque plutôt que
             # de le deviner/cacher à l'avance : si Enable Banking refuse, il le dira lui-même
             # (message clair renvoyé via _safe_upstream_error), jamais une réponse inventée ici.
@@ -631,14 +630,14 @@ def enablebanking_pending():
 
 # ============================================================
 # POWENS — liaison d'un nouveau compte (2026-07-28, retour de Stéphane après avoir buté sur
-# Enable Banking pour BCP : contrairement à Enable Banking en self-service (sandbox, ne peut
+# Enable Banking pour une banque : contrairement à Enable Banking en self-service (sandbox, ne peut
 # JAMAIS connecter de vraie banque, voir _eb_credentials), Powens connecte de VRAIES données
-# malgré le nom "sandbox" du domaine — déjà prouvé avec le vrai compte BCP de Stéphane
+# malgré le nom "sandbox" du domaine — déjà prouvé avec un vrai compte
 # (connector_powens.py). Jusqu'ici seul fetch() [solde d'un compte DÉJÀ lié] existait ; la
 # liaison initiale (webview) avait été faite une fois à la main.
 #
 # Pas de callback serveur automatique (contrairement à Enable Banking) : la console Powens de
-# l'app "smc" n'autorise QU'UNE SEULE redirect_uri exacte, déjà fixée à `https://structory.ai/`
+# l'app de l'org n'autorise QU'UNE SEULE redirect_uri exacte, déjà fixée à `https://structory.ai/`
 # (vérifié en conditions réelles le 2026-07-28 — capture d'écran de la console Powens) —
 # notre serveur (pas de HTTPS configuré sur ce VPS pour l'instant) ne peut pas être enregistré
 # à sa place. Flux adapté en conséquence, réutilisant EXACTEMENT ce qui marchait déjà lors du
@@ -652,8 +651,8 @@ def enablebanking_pending():
 # URI de redirection unique de la plateforme (reçoit connection_id après la webview) — chaque
 # app Powens créée par une org doit configurer EXACTEMENT cette URI côté leur console (voir
 # guide OrgPanel.html), sinon Powens refuse la redirection (piège réel vécu le 2026-08-02 :
-# Stéphane avait enregistré "http://structory.ai" — sans "s", sans slash final — pour l'app
-# smcdemo, qui n'aurait jamais fonctionné tant que ça ne correspond pas caractère pour
+# Stéphane avait enregistré "http://structory.ai" — sans "s", sans slash final — pour une app
+# de test, qui n'aurait jamais fonctionné tant que ça ne correspond pas caractère pour
 # caractère).
 POWENS_REDIRECT_URI = 'https://structory.ai/'
 
@@ -729,7 +728,7 @@ def powens_start_auth():
         if not credentials:
             return jsonify({'success': False, 'error': 'Aucun identifiant Powens configuré pour cette organisation'}), 404
 
-        # '18100230' = repli legacy pour smcspl uniquement, dont le secret a été enregistré
+        # '18100230' = repli legacy pour une org historique uniquement, dont le secret a été enregistré
         # avant que client_id soit stocké par org (voir _powens_credentials) — toute org
         # bootstrappée après le 2026-08-02 a son propre client_id, jamais cette valeur.
         client_id = credentials.get('client_id') or '18100230'
@@ -759,7 +758,7 @@ def powens_start_auth():
 def _powens_already_linked_ids(org_id):
     """IDs de comptes Powens déjà attachés à une brique Compte de cette org — pour ne jamais
     proposer/auto-attacher un compte déjà automatisé ailleurs (bug réel trouvé 2026-08-06,
-    retour de Stéphane : cherchait à ajouter un compte épargne BCP, le système a auto-attaché
+    retour de Stéphane : cherchait à ajouter un compte épargne, le système a auto-attaché
     silencieusement le compte COURANT déjà automatisé, sans jamais vérifier qu'il l'était déjà —
     ni la nature ni le statut "déjà lié" n'étaient contrôlés avant d'attacher)."""
     try:
@@ -780,7 +779,7 @@ def powens_accounts_all():
     """Tous les comptes Powens déjà accessibles pour cette org, TOUTES connexions confondues
     (2026-08-06) — permet de proposer un compte à automatiser sans relancer la webview/re-login
     si l'org a déjà une connexion vers cette banque (retour de Stéphane : "pour rechercher
-    d'autres comptes il demande de rerentrer les identifiants bcp alors qu'il les a déjà depuis
+    d'autres comptes il demande de rerentrer les identifiants de la banque alors qu'il les a déjà depuis
     la première recherche" — `/users/me/accounts` sans filtre de connexion renvoie déjà TOUT,
     inutile de repasser par une nouvelle webview). Chaque compte porte `alreadyLinked` (déjà
     attaché à une brique Compte de cette org, voir _powens_already_linked_ids) — l'appelant ne
@@ -839,7 +838,7 @@ def powens_link_connection():
     précise. Body: {orgId, connectionIdOrUrl}.
 
     Bug réel trouvé et corrigé le 2026-07-28 (retour de Stéphane : "ça m'a fait apparaître
-    tous les BCP") : `/users/me/accounts` renvoie TOUS les comptes de TOUTES les connexions
+    tous les comptes") : `/users/me/accounts` renvoie TOUS les comptes de TOUTES les connexions
     Powens de l'org, pas seulement ceux de la connexion qu'on vient d'établir — filtré
     maintenant sur `id_connection` (via `/users/me/connections`). Chaque compte porte aussi
     `bankName` (résolu via `id_bank` de la connexion + catalogue `/2.0/banks`) — jamais
@@ -878,7 +877,7 @@ def powens_link_connection():
         # `alreadyLinked` (2026-08-06, voir _powens_already_linked_ids) : bug réel corrigé —
         # l'appelant (Navigator) auto-attachait le seul compte renvoyé SANS jamais vérifier s'il
         # était déjà attaché à une autre brique Compte (cas réel : recherche d'un compte épargne
-        # BCP, le compte COURANT déjà automatisé était le seul renvoyé et se faisait ré-attacher
+        # secondaire, le compte COURANT déjà automatisé était le seul renvoyé et se faisait ré-attacher
         # silencieusement, comme si un nouveau compte avait été trouvé).
         already_linked = _powens_already_linked_ids(org_id)
         for a in accounts:
@@ -908,9 +907,9 @@ def powens_link_connection():
 _BANK_DIRECTORY_TTL_SECONDS = 24 * 60 * 60
 _bank_directory_cache = {}
 
-# Domaine Powens partagé (l'app "smc"), utilisé comme catalogue PAR DÉFAUT pour toute org qui
-# n'a pas encore configuré son propre domaine Powens (2026-08-01, retour de Stéphane : "smcdemo
-# c'est pas possible qu'il trouve aucune banque"). Vérifié en conditions réelles : GET
+# Domaine Powens partagé (app Powens de la plateforme), utilisé comme catalogue PAR DÉFAUT pour
+# toute org qui n'a pas encore configuré son propre domaine Powens (2026-08-01 : une org de démo
+# ne trouvait aucune banque sans ce repli). Vérifié en conditions réelles : GET
 # /2.0/connectors/ répond SANS AUCUNE authentification (curl direct, code 200, catalogue complet
 # ~1875 banques) — ce n'est PAS un raccourci qui expose un compte/utilisateur Powens d'une autre
 # org, c'est un catalogue public par construction de l'API. Ne sert QUE pour PARCOURIR les
@@ -954,7 +953,7 @@ def _enablebanking_bank_list(org_id):
     # Mode sandbox : /auth force Mock ASPSP quoi qu'on envoie (voir enablebanking_start_auth) —
     # montrer les ~800 vraies banques du catalogue dans la recherche alors qu'aucune n'est
     # réellement connectable serait trompeur, exclu de la recherche. Mode 'restricted' (2026-07-29,
-    # retour de Stéphane : chercher "Crédit Mutuel" ne trouvait rien alors que l'org a DÉJÀ un
+    # retour de Stéphane : chercher la banque de l'org ne trouvait rien alors que l'org a DÉJÀ un
     # vrai accès Enable Banking pour ce compte) INCLUS ici : /aspsps donne le catalogue complet
     # (2632 banques, vérifié) même avec une app Restricted — seule la LIAISON peut échouer, pas
     # la lecture du catalogue. Ne jamais cacher une banque réellement reconnue par Enable
@@ -1034,7 +1033,7 @@ def banks_search():
 
     Dédoublonnage (2026-07-29) : depuis que le catalogue Enable Banking "restricted" est inclus
     (voir _eb_credentials), une même banque peut apparaître via Powens ET Enable Banking (ex.
-    "Crédit Mutuel") — jamais deux lignes identiques pour la même banque.
+    une même banque connue des deux) — jamais deux lignes identiques pour la même banque.
 
     Priorité (révisée 2026-07-29 soir, après confirmation réelle) : Enable Banking en mode
     'production' (vrais identifiants self-service, peut réellement lier) passe devant Powens —
@@ -1042,7 +1041,7 @@ def banks_search():
     Stéphane a testé et confirmé que la LIAISON d'un nouveau compte échoue vraiment ("Impossible
     de contacter cette banque"). Proposer en premier une option qu'on SAIT ne pas fonctionner
     n'aide personne, même si Enable Banking reste la priorité produit globale — Powens (prouvé
-    fonctionnel, voir BCP) passe donc devant pour tout doublon en mode 'restricted'."""
+    fonctionnel en conditions réelles) passe donc devant pour tout doublon en mode 'restricted'."""
     org_id = request.args.get('orgId', '')
     query = (request.args.get('q') or '').strip().lower()
     # `includeAll=1` (2026-07-31, voir le Flow visible côté Navigator) : ne déduplique PAS —
@@ -1076,7 +1075,7 @@ def banks_search():
 
     if query:
         # Insensible aux accents (bug réel trouvé 2026-07-29, retour de Stéphane : chercher
-        # "credit mutuel" sans accent ne trouvait rien alors que "Crédit Mutuel" existe bien
+        # un nom saisi sans accent ne trouvait rien alors qu'il existe avec accent
         # dans le catalogue) — comparaison sur les noms "repliés", jamais sur l'affichage.
         folded_query = _fold_accents(query)
         banks = [b for b in banks if folded_query in _fold_accents(b['name'].lower())]
@@ -1627,10 +1626,10 @@ def _build_patrimoine_payload(org_id, module=None, prefix='Actif:Banque'):
     Le total ET la variation globale sont calculés en SOMMANT la liste des comptes retournée
     (pas via `/api/ledger/patrimoine`, qui somme brut tout le préfixe `Actif:Banque` du grand
     livre) — bug réel trouvé le 2026-07-28 : deux écritures de test posées directement dans le
-    journal pendant le développement du connector Powens (`Actif:Banque:Test:Jojo:épargne` et
-    `Actif:Banque:Bcp:Jojo:épargne`, 2541€ + 2517€) n'ont jamais eu de brique Compte associée
+    journal pendant le développement du connector Powens (deux écritures `Actif:Banque:...` de test,
+    quelques milliers d'euros chacune) n'ont jamais eu de brique Compte associée
     (ou une brique de test jamais nettoyée) et gonflaient silencieusement le total envoyé par
-    email (310 438,84 € au lieu de ~305 327 €) sans jamais apparaître nulle part dans l'app pour
+    email (un total gonflé de quelques milliers d'euros) sans jamais apparaître nulle part dans l'app pour
     que quelqu'un le remarque. Sommer la liste des VRAIES briques Compte garantit que le total
     affiché correspond TOUJOURS exactement à ce qui est listé juste en dessous — plus jamais un
     écart invisible entre les deux.
@@ -1650,7 +1649,7 @@ def _build_patrimoine_payload(org_id, module=None, prefix='Actif:Banque'):
     comptes_out = []
     for c in comptes:
         # Bug réel trouvé et corrigé le 2026-07-29 (retour de Stéphane : "il y avait pas le
-        # compte bcp hier donc non ca ne fonctionne pas") : un compte SANS historique (créé le
+        # compte hier donc non ca ne fonctionne pas") : un compte SANS historique (créé le
         # jour même, ou dont c'est la 1re valeur jamais constatée) faisait `variation = 0.0`
         # par défaut — traité comme s'il avait TOUJOURS existé avec ce solde, donc invisible
         # dans le total ET dans le détail par compte alors qu'il s'agit d'une vraie augmentation
@@ -1753,7 +1752,7 @@ _JOURS_FR = ['lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi', 'diman
 # --- Journal = source de verite (R-SMC-0003) : les reglages/evenements SMC vivent dans le
 # journal ledger-cli de l'org (sur son OwnStorage/Drive), en lignes commentees '#' que ledger
 # ignore pour la compta. Plus aucun reglage utilisateur dans un fichier du serveur (qu'un
-# incident VPS effacerait -- cause reelle de la perte du planning smcspl fin aout 2026). ---
+# incident VPS effacerait -- cause reelle de la perte du planning d'une org fin aout 2026). ---
 def _journal_get(org_id):
     r = requests.get(f'{ANALYZOR_URL}/api/ownstorage/journal', params={'orgId': org_id}, timeout=20)
     r.raise_for_status()
