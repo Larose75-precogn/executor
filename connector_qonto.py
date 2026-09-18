@@ -7,8 +7,8 @@ HTTP Basic mais n'en est PAS un — pas de Base64). GET /v2/organization renvoie
 depuis la clé elle-même (pas de slug dans l'URL) + son tableau bank_accounts[].
 
 Différence structurelle importante avec Mercury : **une clé API Qonto = une seule
-organisation**. "Ferme Verte 323" et "Ferme Verte Photovoltaïque" (2 titulaires différents
-dans nos données) sont très probablement 2 organisations Qonto distinctes, donc 2 clés API
+organisation**. deux titulaires différents dans les données d'une org (« Compte pro A », « Compte pro B »)
+sont très probablement 2 organisations Qonto distinctes, donc 2 clés API
 séparées — jamais une seule clé partagée. Voir `secret_name_for_compte()` dans
 executor/app.py : le nom du secret est dérivé du `titulaire` de la brique Compte, pas fixe
 comme pour Mercury.
@@ -21,10 +21,8 @@ QONTO_API_BASE = 'https://thirdparty.qonto.com'
 def fetch(compte_brick, api_key):
     """Une clé API Qonto authentifie UNE organisation entière (voir docstring du module), pas un
     compte précis — et contrairement à Mercury, le `name` d'un bank_account Qonto est un libellé
-    libre choisi par l'utilisateur dans Qonto ("Compte principal", "Cal&Co Gallion Sdc
-    Distillerie", ...) qui ne contient JAMAIS le nom du titulaire ni de notre brique Compte
-    (vérifié en conditions réelles, 2026-07-25 : aucun des deux bank_accounts de "LA FERME
-    VERTE" ne matchait 'Ferme Verte 323'). Le matching par nom est donc inutilisable comme
+    libre choisi par l'utilisateur dans Qonto ("Compte principal", "Compte secondaire", ...) qui ne contient JAMAIS le nom du titulaire ni de notre brique Compte
+    (vérifié en conditions réelles, 2026-07-25 : aucun des deux bank_accounts d'une org ne matchait le nom de sa brique Compte). Le matching par nom est donc inutilisable comme
     critère principal ici.
 
     Stratégie : ne garder que les comptes `status == 'active'` (les comptes clôturés restent

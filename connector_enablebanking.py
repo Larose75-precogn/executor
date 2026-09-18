@@ -6,9 +6,9 @@ au consentement PSD2 (SCA) donné une fois par l'utilisateur sur le site de sa b
 Authentification : JWT RS256 signé par la clé privée de l'application (générée par Enable
 Banking à l'enregistrement de l'app, jamais rotée automatiquement), `kid` = application_id.
 Un seul jeu app_id + clé privée sert pour TOUTES les banques/comptes connectés via Enable
-Banking, quel que soit l'établissement — ce n'est PAS un connector "Crédit Mutuel", c'est un
+Banking, quel que soit l'établissement — ce n'est PAS un connector lié à un établissement précis, c'est un
 connector générique réutilisable pour n'importe quel établissement européen supporté par Enable
-Banking (2026-07-25/26, retour de Stéphane après avoir lié Crédit Mutuel).
+Banking (2026-07-25/26, après avoir lié un premier établissement européen).
 
 Contrainte réelle de l'API découverte en testant : il n'existe PAS d'endpoint pour lister les
 comptes déjà autorisés d'une session existante avec leurs détails (IBAN/nom) — seul le retour
@@ -109,8 +109,8 @@ def fetch(compte_brick, credentials_json):
 def fetch_transactions(compte_brick, credentials_json, page_limit=200, max_pages=10):
     """JournaldeBanque (2026-08-14) — historique DÉTAILLÉ des transactions d'un compte déjà
     lié, jamais consommé jusqu'ici (`fetch()` ci-dessus ne remonte que le solde). Vérifié en
-    HTTP direct, lecture seule, avec de VRAIES données smcspl (2026-08-13, Crédit Mutuel EURL
-    SPL, voir ~/projects/jdb/CLAUDE.md) : `GET /accounts/{uid}/transactions` répond `200`,
+    HTTP direct, lecture seule, avec de vraies données d'une org (2026-08-13, un établissement
+    européen via Enable Banking) : `GET /accounts/{uid}/transactions` répond `200`,
     format PSD2/CAMT-like — `transaction_amount.{amount,currency}`, `credit_debit_indicator`
     (DBIT/CRDT), `booking_date`/`value_date`/`transaction_date` (3 dates distinctes, on garde
     `booking_date` par défaut — c'est la date qui fait foi côté banque, comme pour un relevé
